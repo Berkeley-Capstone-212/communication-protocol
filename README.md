@@ -21,8 +21,8 @@ This library implements that idea for drones:
 
 Language: ISO C90, which also compiles as C++98. You can call it from C# through P/Invoke
 on the `sw_*` functions. It uses no heap, no globals and no OS calls. With the
-default limits the code is about 9.5 KB and each node needs 8.7 KB of RAM
-(`sw_node`, or 7.5 KB with `SW_FLOAT`).
+default limits the code is about 10.7 KB (arm64, `-Os`) and each node needs
+8.5 KB of RAM (`sw_node`, or 7.4 KB with `SW_FLOAT`).
 
 ```
 include/swarm.h     API, wire constants, compile-time limits
@@ -33,11 +33,27 @@ test/test_swarm.c   unit, fuzz and swarm-simulation tests
 ## Build
 
 ```
-make            # build/libswarm.a  (-std=c89 -pedantic -Werror, -Os, section GC ready)
+make            # build/libswarm.a  (C89, strict warnings as errors, -Os, section GC ready)
 make test       # 3 configs under ASan/UBSan: default, tiny tables, single precision
 make cxx        # same source as C++98
+make lint       # Clang only: -Weverything -Werror and the static analyser
 make size
 ```
+
+**Warnings.** `make`, `make test` and `make cxx` use a warning set that GCC
+and Clang share, all as errors. That set includes `-Wconversion`,
+`-Wsign-conversion`, `-Wfloat-equal`, `-Wcast-align`, `-Wdouble-promotion`,
+`-Wbad-function-cast` and `-Wmissing-prototypes`. `make lint` goes further.
+On the default configuration it runs every Clang warning (`-Weverything`,
+including `-Wpadded`) on the library, the tests and the header compiled as
+C++98, and also runs the static analyser. All of these report nothing. Two
+cases are left out on purpose:
+
+- `-Wold-style-cast` when the `.c` file is compiled as C++. C casts are
+  inherent to C code; the public header itself is clean as C++.
+- `-Wpadded` in other configurations, such as single precision on 64-bit
+  (`sw_state`) or non-default table sizes. Padding there depends on the
+  configuration; the default layout has none.
 
 Link with `-lm`. For the smallest firmware, link with `-Wl,--gc-sections`
 (GNU) or `-Wl,-dead_strip` (Apple). `SW_FLOAT` switches all real arithmetic
@@ -72,12 +88,85 @@ with K = `SW_GATE_K` and A = `SW_ACC`.
 - **Discovery**: a `SW_BCAST` beacon carries only the sender's context, so
   drones can learn each other's positions before any edge is known.
 
+### Node identification
+
+A drone is identified by a 16-bit id, 2 bytes on the wire. The id is
+assigned before the mission; `0xFFFF` is reserved for beacons. Peers and
+links are looked up through a sorted index: an ascending array of ids plus a
+byte array of table slots. Lookups are a binary search over a few cache lines
+(at most 5 comparisons for 32 peers). Inserting or removing an id shifts only
+those small arrays; the 136-byte contexts never move.
+
+A relayed context is looked up by id before anything else is done with it.
+Most relayed contexts are copies the drone already holds, and those are
+dropped without decoding their pose, so the trigonometric decode runs only
+for contexts that are actually stored. Building the neighbour list predicts
+our own position once per call, and takes a square root only for peers just
+beyond nominal range.
+
+Measured on an Apple M-series machine at `-O2`, with 32 drones known and a
+1.4 KB frame carrying about 28 relayed contexts:
+
+- Identifying and merging the contexts takes 0.24 µs per frame, down from
+  0.50 µs with linear scans.
+- Building the neighbour list takes 0.04 µs.
+- The frame's keyed BLAKE2s tag check takes 3.3 µs. That is the
+  authentication cost, and it now dominates.
+
+### Dynamic links
+
+Links come and go: two drones may talk for 2 minutes, be out of touch for 4,
+then meet again. The protocol needs no special handling for this and holds
+no assumption that an edge persists:
+
+- **The graph is recomputed every tick.** Out-neighbours come from the
+  freshest known positions (`sw_tick`). A drone not heard from, directly or
+  through relays, for `SW_TTL_MS` is forgotten. A drone known only through
+  relays becomes a direct neighbour again as soon as geometry allows, even
+  before its next beacon.
+- **Coming back resets stale link state.** When a neighbour reappears after
+  more than `SW_TTL_MS`, the probe queue, push queue and remembered root are
+  dropped, and synchronisation starts again from its root hash.
+- **Leaf records never expire.** The CRDT merges whatever both sides did
+  while apart. After reconnection the change log and the Merkle descent
+  bring both sides to the same root within about a second.
+- **Link slots rotate.** A drone can have more neighbours than
+  `SW_MAX_NBR`. In that case slots go first to links that have been out of
+  touch, then to links already in sync with us. Otherwise they rotate
+  first-in-first-out after `SW_SLOT_MS`. `sw_tick` also starts its neighbour
+  list at a moving offset, so no neighbour is starved of a slot. Frames
+  to a neighbour without a slot return `SW_ESLOT`; retry next tick. Frames
+  received from it are still merged in full.
+
+Duplicate work while apart: no information crosses an outage, so a task
+both sides believe is free can be done twice. Two planner levers avoid
+this, and both are built in:
+
+- Claim with a **lease** longer than the expected outage (the `lease`
+  argument of `sw_task`).
+- Claim **ahead** the work the drone will do during an outage. A drone may
+  hold several claims at once.
+
+Measured in the simulation: 12 drones in two clusters, the link between
+the clusters up 2 min and down 4 min, repeating; tasks take 200 s; the
+outage starts on a task boundary (worst case).
+
+| Planner policy | Duplicate completions | Work lost to conflicts | Mission time | Worst heal after reconnecting |
+|---|---|---|---|---|
+| 30 s lease, current task only | 6 | 880 s | 1080 s | 0.3 s |
+| 900 s lease, 3 tasks claimed ahead | 0 | 0.6 s | 801 s | 0.4 s |
+
+With tables far smaller than the swarm (`SW_MAX_NODES=6`, `SW_MAX_NBR=3`,
+`SW_LOG=4`), the worst heal is 1.6 s.
+
 ### Context
 
 Each context carries: id, hop count, origin stamp, range, mtu, pose, sigmas,
 an **operation info placeholder** (`SW_OP_MAX` bytes) and a **context
 placeholder** (`SW_CTX_MAX` bytes). Both placeholders are opaque to the
-protocol and only length-checked. Until their contents are decided, we
+protocol and only length-checked. The default sizes (8 and 21 bytes) fill
+`sw_ctx` exactly, so bytes that would otherwise be padding are usable. Until
+their contents are decided, we
 recommend a self-describing TLV layout (`type u8, len u8, value`) so fields
 can be added without a protocol version bump.
 
@@ -139,14 +228,18 @@ state-based CRDT: merge is commutative, associative and idempotent. Replicas
 therefore converge regardless of delivery order, loss, duplication or
 replay.
 
-- **claim**: `ver = max(now + SW_LEASE_MS, ver + 1)`, so `ver` is the lease
-  expiry. A live claim by another drone can only be taken with a strictly
-  lower cost (an auction). The owner renews at half-life inside `sw_tick`.
-  If the owner dies, the lease expires and the leaf becomes claimable.
+- **claim**: `ver = max(now + lease, ver + 1)`, so `ver` is the lease
+  expiry. The lease is per claim and defaults to `SW_LEASE_MS`. A live claim
+  by another drone can only be taken with a strictly lower cost (an
+  auction). Near expiry the owner renews it inside `sw_tick`. If the owner
+  dies, the lease expires and the leaf becomes claimable.
 - **release**: allowed only for the owner. It writes `OPEN` with `ver + 1`.
 - **done**: absorbing. It dominates everything.
 - Two concurrent claims resolve deterministically. The loser sees
-  `rec[leaf].owner != self` and stops.
+  `sw_leaf(...).owner != self` and stops.
+
+Records are stored in their 9-byte wire form, with no padding. Hashing and
+encoding them is a plain copy, and `sw_leaf` decodes one for the planner.
 
 Hashes: `leaf = H(index ‖ record)` (11 bytes) and
 `node = H(child hashes)` (a multiple of 8 bytes, so it never collides in
@@ -162,7 +255,9 @@ There are three paths, cheapest first:
 1. **Change log**: every record change goes into a ring (`SW_LOG`). Each
    link has a cursor and receives the changes it hasn't seen, except changes
    that came from that neighbour. Fresh claims flood within one frame per
-   hop. A new link starts at the oldest entry still in the ring.
+   hop. A new link starts at the oldest entry still in the ring. A link
+   that took over a rotated slot starts at the head of the ring instead,
+   and relies on the Merkle descent below.
 2. **Merkle descent**: when a neighbour's last advertised root differs from
    ours, we send **probes**. A probe for node P contains P's child hashes,
    with full records for leaf children. The receiver merges those records.
@@ -217,29 +312,29 @@ Context (43 bytes plus the placeholders):
 
 Record (9 bytes): `st u8, owner u16, cost u16, ver u32`.
 
-`SW_FRAME_MIN` (180 bytes by default) is the smallest MTU that always fits
+`SW_FRAME_MIN` (185 bytes by default) is the smallest MTU that always fits
 the own context, the largest probe and one record, so every frame makes
 progress. Mesh radios with a 255-byte payload work as-is.
 
 ## Use
 
 ```c
-static sw_node node;                         /* 8.7 KB, no heap */
+static sw_node node;                         /* 8.5 KB, no heap */
 sw_init(&node, my_id, range_m, mtu, cnt, ntask, key, keylen);
 
 for (;;) {                                   /* e.g. 10 Hz */
     sw_set_self(&node, &estimator_output, now);
     m = sw_tick(&node, now, nbr, MAXN);      /* maintenance + out-neighbours */
-    for (i = 0; i < m; i++)
+    for (i = 0; i < m; i++)                  /* SW_ESLOT: served next turn */
         if ((len = sw_encode(&node, nbr[i], now, buf, sizeof buf)) > 0)
             radio_send(nbr[i], buf, len);
     if (m == 0 || beacon_due)
         radio_send_all(buf, sw_encode(&node, SW_BCAST, now, buf, sizeof buf));
     while (radio_recv(buf, &len))
         sw_decode(&node, buf, len, now);
-    /* planner: sw_task(&node, leaf, SW_CLAIMED, cost, now) -> work ->
-       sw_task(&node, leaf, SW_DONE, cost, now); give up when
-       node.rec[leaf].owner != my_id */
+    /* planner: sw_task(&node, leaf, SW_CLAIMED, cost, lease, now) for the
+       next task(s) -> work -> sw_task(&node, leaf, SW_DONE, cost, 0, now);
+       drop a task when sw_leaf(&node, leaf, &r) shows r.owner != my_id */
 }
 ```
 
@@ -281,14 +376,17 @@ For the descent livelock, the test was confirmed to fail with the old code.
 | Forged frames (for example a fake "goal done") | Keyed BLAKE2s tag. The mission id binds key, tree and build options | `SW_EAUTH` / `SW_EMISSION` tests |
 | Replay, reordering, duplicates | CRDT merge is idempotent and stamps only move forward | replay test |
 | Frame rejected halfway | Merges are monotone, so an applied prefix is still a valid state | fuzz invariants |
-| Duplicate work | Total-order conflict resolution, claims flood via the change log, losers detect ownership change | simulation: 0 duplicate completions, about 30 early abandons |
-| Drone dies holding a task | Lease with half-life renewal | simulation: leaf taken over 1 ms after lease expiry |
+| Duplicate work | Total-order conflict resolution, claims flood via the change log, losers detect ownership change | simulation: 0 duplicate completions, under 1 s of work lost to conflicts |
+| Duplicate work across link outages | Per-claim lease, multiple claims ahead, deterministic merge on reconnection | on/off simulation: 0 duplicates with the recommended policy |
+| Drone dies holding a task | Lease with renewal near expiry | simulation: the leaf is taken over only after the lease the others knew had expired |
 | Partition heal, log overflow | Merkle descent with a persistent per-link probe queue | 3 to 5 rounds for 46 divergent leaves, across schedules and tree depths |
 | Descent livelock from beacons or unequal send rates (review finding) | The queue is no longer cleared on arrival; only unicasts mark a link fresh | `heal()` schedules; fails if the old behaviour is restored |
 | Replayed old frames passing the gate (review finding) | Sender context age is bounded by the TTL | replay-after-TTL test |
 | Overflow to NaN inside J⁻¹ on huge finite input (review finding) | NaN-safe range check in quantisation | 1e300 / 3e38 input test |
 | Asymmetric ranges (one-way edges) | Sweep fallback | 3 frames |
-| More drones or neighbours than the tables hold | Farthest-then-oldest eviction for contexts; LRU for links, and a new link replays the ring | `SW_MAX_NODES=6, SW_MAX_NBR=3, SW_LOG=4` converges |
+| More drones than the context table holds | Farthest-then-oldest eviction; id index kept consistent | `SW_MAX_NODES=6`; index invariants checked after 50k random operations and after every fuzzed frame |
+| More neighbours than link slots: LRU evicted every link on every frame, and the highest ids starved; repair never finished (found in this loop) | Slot rotation: out-of-touch links first, then in-sync ones, then FIFO after `SW_SLOT_MS`; rotating neighbour order; no ring replay on rotated slots | tiny-table on/off simulation: never healed before the fix, 1.6 s after |
+| Link state from before an outage | Reset when a neighbour reappears after `SW_TTL_MS` | on/off simulation |
 | SE(3) quantisation coupling | θ quantised first, J⁻¹ evaluated at the quantised θ, residual folded into σ | 0.7 mm at 50 km; error ≤ reported σ always |
 | Overconfident gating | Sigmas rounded up, unknown saturates, inflated with age | Lie tests |
 | Clock skew, wrap | Future stamps beyond `SW_SKEW_MS` rejected; 49-day horizon; `SW_ETIME` on version exhaustion | stale-stamp test |
@@ -308,6 +406,9 @@ For the descent livelock, the test was confirmed to fail with the old code.
   holds the key can lie about its pose or mark tasks done.
 - **Airtime.** Per-neighbour unicast costs one frame per neighbour per
   tick. Tune the tick rate to the radio budget.
+- **Toolchains.** Builds were verified with Apple Clang 21 (C89, C99, C++98).
+  GCC was not available on the build machine, but the warning set used is
+  one GCC accepts.
 - **Static goal tree.** Re-planning means a new mission id.
 - **Outbidding** can ping-pong if cost estimates oscillate. Add hysteresis
   in the planner.

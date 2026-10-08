@@ -3,6 +3,7 @@
  */
 #include "swarm.h"
 
+#include <float.h>
 #include <math.h>
 #include <string.h>
 
@@ -13,6 +14,7 @@
 #define RATAN2 atan2f
 #define RFLOOR floorf
 #define RCEIL ceilf
+#define RMAX FLT_MAX
 #else
 #define RSQRT sqrt
 #define RSIN sin
@@ -20,6 +22,7 @@
 #define RATAN2 atan2
 #define RFLOOR floor
 #define RCEIL ceil
+#define RMAX DBL_MAX
 #endif
 
 /* compile-time limits: a negative array size stops the build */
@@ -235,30 +238,83 @@ static sw_u32 age(sw_u32 stamp, sw_u32 now)
     return stamp >= now ? 0 : now - stamp;
 }
 
-/* constant-velocity prediction to now; returns position 1-sigma */
+/* constant-velocity prediction to now; returns the position variance */
 static sw_real predict(const sw_ctx *c, sw_u32 now, sw_real *p)
 {
-    sw_real dt = (sw_real)age(c->stamp, now) * (sw_real)1e-3, w;
+    sw_u32 ms = age(c->stamp, now);
+    sw_real dt = (sw_real)ms * (sw_real)1e-3, w;
     unsigned i;
 
     for (i = 0; i < 3; i++)
         p[i] = c->p[i] + c->v[i] * dt;
     w = (sw_real)SW_ACC * dt * dt / 2;
-    return RSQRT(c->sp * c->sp + c->sv * dt * c->sv * dt + w * w);
+    return c->sp * c->sp + c->sv * dt * c->sv * dt + w * w;
 }
 
-/* directed edge a -> b of the reach graph: b within a's radio range */
-static int reach(const sw_ctx *a, const sw_ctx *b, sw_u32 now)
+/* Directed edge a -> b of the reach graph: b within a's range, widened by
+ * K sigma of the combined uncertainty. The caller predicts a once; a
+ * square root is only taken beyond the nominal range. */
+static int edge(const sw_real *pa, sw_real va, unsigned range,
+                const sw_ctx *b, sw_u32 now)
 {
-    sw_real pa[3], pb[3], d[3], sa, sb, g;
+    sw_real pb[3], vb, d2 = 0, r = (sw_real)range, x;
     unsigned i;
 
-    sa = predict(a, now, pa);
-    sb = predict(b, now, pb);
-    for (i = 0; i < 3; i++)
-        d[i] = pa[i] - pb[i];
-    g = (sw_real)a->range + (sw_real)SW_GATE_K * RSQRT(sa * sa + sb * sb);
-    return d[0] * d[0] + d[1] * d[1] + d[2] * d[2] <= g * g;
+    vb = predict(b, now, pb);
+    for (i = 0; i < 3; i++) {
+        x = pa[i] - pb[i];
+        d2 += x * x;
+    }
+    if (d2 <= r * r)
+        return 1;
+    x = RSQRT(d2) - r;
+    return x * x <= (sw_real)(SW_GATE_K * SW_GATE_K) * (va + vb);
+}
+
+/* ---- id index: ids[] ascending, slot[k] is the table slot of ids[k] ----
+ * Lookups are a binary search over a few cache lines of 16-bit ids; table
+ * entries never move on insert, so only bytes are shifted. */
+
+static unsigned ix_pos(const sw_u16 *ids, unsigned n, unsigned id)
+{
+    unsigned lo = 0, hi = n, mid;
+
+    while (lo < hi) {
+        mid = (lo + hi) >> 1;
+        if (ids[mid] < id)
+            lo = mid + 1;
+        else
+            hi = mid;
+    }
+    return lo;
+}
+
+static int ix_find(const sw_u16 *ids, const sw_u8 *slot, unsigned n,
+                   unsigned id)
+{
+    unsigned k = ix_pos(ids, n, id);
+
+    return k < n && ids[k] == id ? slot[k] : -1;
+}
+
+/* n is the entry count before the change */
+static void ix_add(sw_u16 *ids, sw_u8 *slot, unsigned n, unsigned id,
+                   unsigned s)
+{
+    unsigned k = ix_pos(ids, n, id);
+
+    memmove(ids + k + 1, ids + k, (n - k) * sizeof *ids);
+    memmove(slot + k + 1, slot + k, n - k);
+    ids[k] = (sw_u16)id;
+    slot[k] = (sw_u8)s;
+}
+
+static void ix_del(sw_u16 *ids, sw_u8 *slot, unsigned n, unsigned id)
+{
+    unsigned k = ix_pos(ids, n, id);
+
+    memmove(ids + k, ids + k + 1, (n - k - 1) * sizeof *ids);
+    memmove(slot + k, slot + k + 1, n - k - 1);
 }
 
 /* ---- context wire ------------------------------------------------------ */
@@ -293,7 +349,8 @@ static sw_u8 *ctx_put(sw_u8 *w, const sw_ctx *c, unsigned hops)
     return w + c->ctx_len;
 }
 
-/* returns NULL on malformed input; c->hops is the wire value */
+/* returns NULL on malformed input; c->hops is the wire value. The decoded
+ * cache is left to the caller, so duplicates cost no trigonometry. */
 static const sw_u8 *ctx_get(sw_ctx *c, const sw_u8 *p, const sw_u8 *e)
 {
     unsigned i;
@@ -333,18 +390,14 @@ static const sw_u8 *ctx_get(sw_ctx *c, const sw_u8 *p, const sw_u8 *e)
     if (c->ctx_len > SW_CTX_MAX || e - p < (long)c->ctx_len)
         return 0;
     memcpy(c->ctx, p, c->ctx_len);
-    ctx_cache(c);
     return p + c->ctx_len;
 }
 
 static sw_ctx *peer_find(sw_node *n, unsigned id)
 {
-    unsigned i;
+    int s = ix_find(n->pid, n->pix, n->npeer, id);
 
-    for (i = 0; i < n->npeer; i++)
-        if (n->peer[i].id == id)
-            return &n->peer[i];
-    return 0;
+    return s < 0 ? 0 : &n->peer[s];
 }
 
 /* keep the freshest copy per origin; when full, displace the farthest and
@@ -353,64 +406,84 @@ static sw_ctx *peer_find(sw_node *n, unsigned id)
 static void peer_merge(sw_node *n, const sw_ctx *c, sw_u32 now)
 {
     sw_ctx *o;
-    unsigned i, h = c->hops < 255 ? c->hops + 1U : 255U;
+    int s;
+    unsigned i, w, h = c->hops < 255 ? c->hops + 1U : 255U;
 
     if (c->id == n->self.id || age(c->stamp, now) > SW_TTL_MS ||
         (c->stamp > now && c->stamp - now > SW_SKEW_MS))
         return;
-    o = peer_find(n, c->id);
-    if (o) {
+    s = ix_find(n->pid, n->pix, n->npeer, c->id);
+    if (s >= 0) {
+        o = &n->peer[s];
         if (c->stamp < o->stamp || (c->stamp == o->stamp && h >= o->hops))
             return;
+        if (c->stamp == o->stamp) { /* same estimate by a shorter route */
+            o->hops = (sw_u8)h;
+            return;
+        }
     } else if (n->npeer < SW_MAX_NODES) {
-        o = &n->peer[n->npeer++];
+        ix_add(n->pid, n->pix, n->npeer, c->id, n->npeer);
+        o = &n->peer[n->npeer];
+        n->npeer++;
     } else {
-        o = &n->peer[0];
+        w = 0;
         for (i = 1; i < SW_MAX_NODES; i++)
-            if (n->peer[i].hops > o->hops ||
-                (n->peer[i].hops == o->hops && n->peer[i].stamp < o->stamp))
-                o = &n->peer[i];
+            if (n->peer[i].hops > n->peer[w].hops ||
+                (n->peer[i].hops == n->peer[w].hops &&
+                 n->peer[i].stamp < n->peer[w].stamp))
+                w = i;
+        o = &n->peer[w];
         if (h > o->hops || (h == o->hops && c->stamp <= o->stamp))
             return;
+        ix_del(n->pid, n->pix, SW_MAX_NODES, o->id);
+        ix_add(n->pid, n->pix, SW_MAX_NODES - 1, c->id, w);
     }
     *o = *c;
     o->hops = (sw_u8)h;
+    ctx_cache(o);
+}
+
+/* forget slot i: the last entry moves into it, so only its index entry
+ * needs repointing */
+static void peer_del(sw_node *n, unsigned i)
+{
+    ix_del(n->pid, n->pix, n->npeer, n->peer[i].id);
+    n->npeer--;
+    if (i == n->npeer)
+        return;
+    n->peer[i] = n->peer[n->npeer];
+    n->pix[ix_pos(n->pid, n->npeer, n->peer[i].id)] = (sw_u8)i;
 }
 
 /* ---- goal tree --------------------------------------------------------- */
 
-static void rec_put(sw_u8 *w, const sw_rec *r)
+static void rec_make(sw_u8 *r, unsigned st, unsigned owner, unsigned cost,
+                     sw_u32 ver)
 {
-    w[0] = r->st;
-    put16(w + 1, r->owner);
-    put16(w + 3, r->cost);
-    put32(w + 5, r->ver);
+    r[0] = (sw_u8)st;
+    put16(r + 1, owner);
+    put16(r + 3, cost);
+    put32(r + 5, ver);
 }
 
-static int rec_get(sw_rec *r, const sw_u8 *p)
+/* total order on wire-form records: done first, then version, state, lower
+ * cost, lower owner. Its maximum is a join-semilattice (state-based CRDT). */
+static int rec_gt(const sw_u8 *a, const sw_u8 *b)
 {
-    r->st = p[0];
-    r->owner = (sw_u16)get16(p + 1);
-    r->cost = (sw_u16)get16(p + 3);
-    r->ver = get32(p + 5);
-    return r->st <= SW_DONE;
-}
+    sw_u32 va = get32(a + 5), vb = get32(b + 5);
+    unsigned ca, cb;
 
-/* total order: done first, then version, state, lower cost, lower owner.
- * Its maximum is a join-semilattice, hence a state-based CRDT. */
-static int rec_gt(const sw_rec *a, const sw_rec *b)
-{
-    int ad = a->st == SW_DONE, bd = b->st == SW_DONE;
-
-    if (ad != bd)
-        return ad;
-    if (a->ver != b->ver)
-        return a->ver > b->ver;
-    if (a->st != b->st)
-        return a->st > b->st;
-    if (a->cost != b->cost)
-        return a->cost < b->cost;
-    return a->owner < b->owner;
+    if ((a[0] == SW_DONE) != (b[0] == SW_DONE))
+        return a[0] == SW_DONE;
+    if (va != vb)
+        return va > vb;
+    if (a[0] != b[0])
+        return a[0] > b[0];
+    ca = get16(a + 3);
+    cb = get16(b + 3);
+    if (ca != cb)
+        return ca < cb;
+    return get16(a + 1) < get16(b + 1);
 }
 
 /* dirty marks are closed upward, so stop at the first marked ancestor */
@@ -424,20 +497,20 @@ static void mark(sw_node *n, unsigned i)
     }
 }
 
-static void set_rec(sw_node *n, unsigned leaf, const sw_rec *r, unsigned src)
+static void set_rec(sw_node *n, unsigned leaf, const sw_u8 *r, unsigned src)
 {
     unsigned k = (unsigned)(n->loghead & (SW_LOG - 1));
 
-    n->rec[leaf] = *r;
+    memcpy(n->rec[leaf], r, SW_REC_LEN);
     mark(n, leaf);
     n->logleaf[k] = (sw_u16)leaf;
     n->logsrc[k] = (sw_u16)src;
     n->loghead++;
 }
 
-static void merge_rec(sw_node *n, unsigned leaf, const sw_rec *r, unsigned src)
+static void merge_rec(sw_node *n, unsigned leaf, const sw_u8 *r, unsigned src)
 {
-    if (rec_gt(r, &n->rec[leaf]))
+    if (rec_gt(r, n->rec[leaf]))
         set_rec(n, leaf, r, src);
 }
 
@@ -459,9 +532,9 @@ static void rehash(sw_node *n)
                 done &= n->tflag[n->first[i] + k];
         } else {
             put16(b, i);
-            rec_put(b + 2, &n->rec[i]);
+            memcpy(b + 2, n->rec[i], SW_REC_LEN);
             b2s(n->hash[i], SW_HASH, 0, 0, b, sizeof b);
-            done = n->rec[i].st == SW_DONE ? SW_COMPLETE : 0;
+            done = n->rec[i][0] == SW_DONE ? SW_COMPLETE : 0;
         }
         n->tflag[i] = (sw_u8)done;
     }
@@ -489,7 +562,7 @@ static sw_u8 *probe_put(const sw_node *n, unsigned P, sw_u8 *w)
             memcpy(w, n->hash[c], SW_HASH);
             w += SW_HASH;
         } else {
-            rec_put(w, &n->rec[c]);
+            memcpy(w, n->rec[c], SW_REC_LEN);
             w += SW_REC_LEN;
         }
     }
@@ -510,12 +583,12 @@ static void enqueue(sw_u16 *q, sw_u8 *nq, unsigned v)
 }
 
 /* merge the peer's view of P; queue our leaves that beat theirs, and every
- * internal child whose hash differs, to be described back */
-static const sw_u8 *probe_get(sw_node *n, sw_link *l, const sw_u8 *p,
-                              const sw_u8 *e)
+ * internal child whose hash differs, to be described back (when the peer
+ * holds a link slot) */
+static const sw_u8 *probe_get(sw_node *n, sw_link *l, unsigned src,
+                              const sw_u8 *p, const sw_u8 *e)
 {
     unsigned P, c;
-    sw_rec r;
 
     if (e - p < 2)
         return 0;
@@ -527,17 +600,17 @@ static const sw_u8 *probe_get(sw_node *n, sw_link *l, const sw_u8 *p,
         if (n->cnt[c]) {
             if (e - p < SW_HASH)
                 return 0;
-            if (memcmp(p, n->hash[c], SW_HASH))
+            if (l && memcmp(p, n->hash[c], SW_HASH))
                 enqueue(l->probe, &l->nprobe, c);
             p += SW_HASH;
             continue;
         }
-        if (e - p < SW_REC_LEN || !rec_get(&r, p))
+        if (e - p < SW_REC_LEN || p[0] > SW_DONE)
             return 0;
-        p += SW_REC_LEN;
-        merge_rec(n, c, &r, l->id);
-        if (rec_gt(&n->rec[c], &r))
+        merge_rec(n, c, p, src);
+        if (l && rec_gt(n->rec[c], p))
             enqueue(l->push, &l->npush, c);
+        p += SW_REC_LEN;
     }
     return p;
 }
@@ -557,29 +630,63 @@ static unsigned sweep_next(const sw_node *n, unsigned i)
     return 0;
 }
 
+/* NULL when every slot is younger than SW_SLOT_MS and still in use */
 static sw_link *link_get(sw_node *n, unsigned id, sw_u32 now)
 {
-    sw_link *l = 0;
-    unsigned i;
+    sw_link *l;
+    int s = ix_find(n->lid, n->lix, n->nlink, id);
+    unsigned i, w;
+    sw_u32 pos;
 
-    for (i = 0; i < n->nlink; i++)
-        if (n->link[i].id == id) {
-            l = &n->link[i];
-            break;
+    if (s >= 0) {
+        l = &n->link[s];
+        /* back after an outage: what it told us before is stale */
+        if (age(l->seen, now) > SW_TTL_MS) {
+            l->fb = 0;
+            l->nprobe = 0;
+            l->npush = 0;
         }
-    if (!l) {
+    } else {
+        /* a new neighbour gets the recent changes still in the ring; a
+         * rotated-in one does not, as slots may turn over every frame and
+         * the Merkle descent repairs whatever it missed */
+        pos = n->loghead > SW_LOG ? n->loghead - SW_LOG : 0;
         if (n->nlink < SW_MAX_NBR) {
-            l = &n->link[n->nlink++];
+            w = n->nlink;
+            ix_add(n->lid, n->lix, w, id, w);
+            n->nlink++;
         } else {
-            l = &n->link[0];
+            pos = n->loghead;
+            /* a slot goes to whoever needs it: first a link out of touch,
+             * then one already in sync with us (it only needs the change
+             * log, which a new link replays), else the oldest slot once it
+             * has served its quantum (first-in-first-out rotation) */
+            w = 0;
             for (i = 1; i < SW_MAX_NBR; i++)
-                if (n->link[i].seen < l->seen)
-                    l = &n->link[i];
+                if (n->link[i].seen < n->link[w].seen)
+                    w = i;
+            if (age(n->link[w].seen, now) <= SW_TTL_MS) {
+                for (w = 0; w < SW_MAX_NBR; w++)
+                    if ((n->link[w].fb & FB_ROOT) &&
+                        !memcmp(n->link[w].root, n->hash[0], SW_HASH))
+                        break;
+                if (w == SW_MAX_NBR) {
+                    w = 0;
+                    for (i = 1; i < SW_MAX_NBR; i++)
+                        if (n->link[i].since < n->link[w].since)
+                            w = i;
+                    if (age(n->link[w].since, now) < SW_SLOT_MS)
+                        return 0;
+                }
+            }
+            ix_del(n->lid, n->lix, SW_MAX_NBR, n->link[w].id);
+            ix_add(n->lid, n->lix, SW_MAX_NBR - 1, id, w);
         }
+        l = &n->link[w];
         memset(l, 0, sizeof *l);
         l->id = (sw_u16)id;
-        /* a new neighbour gets the recent changes still in the ring */
-        l->logpos = n->loghead > SW_LOG ? n->loghead - SW_LOG : 0;
+        l->since = now;
+        l->logpos = pos;
     }
     l->seen = now;
     return l;
@@ -594,8 +701,7 @@ int sw_init(sw_node *n, sw_u16 id, sw_u16 range, sw_u16 mtu,
     sw_u8 m[SW_HASH + 3], mid[4];
 
     if (!n || !cnt || ntask < 2 || ntask > SW_MAX_TASK || !cnt[0] ||
-        mtu < SW_FRAME_MIN || klen > SW_KEY_MAX || (klen && !key) ||
-        id == SW_BCAST)
+        mtu < SW_FRAME_MIN || (klen && !key) || id == SW_BCAST)
         return SW_EARG;
     memset(n, 0, sizeof *n);
     /* breadth-first: node i exists only if an earlier node claimed it */
@@ -612,16 +718,15 @@ int sw_init(sw_node *n, sw_u16 id, sw_u16 range, sw_u16 mtu,
     if (next != ntask)
         return SW_EARG;
     n->ntask = (sw_u16)ntask;
-    if (klen)
-        memcpy(n->key, key, klen);
-    n->klen = (sw_u8)klen;
+    /* any key length: derive a fixed-size key for the tag */
+    b2s(n->key, SW_KEY, 0, 0, key, klen);
     /* bind tree shape and wire-shaping build options: mismatched firmware
      * is rejected as another mission instead of as malformed frames */
     b2s(m, SW_HASH, 0, 0, cnt, ntask);
     m[SW_HASH] = SW_OP_MAX;
     m[SW_HASH + 1] = SW_CTX_MAX;
     m[SW_HASH + 2] = SW_FANOUT;
-    b2s(mid, 4, key, klen, m, sizeof m);
+    b2s(mid, 4, n->key, SW_KEY, m, sizeof m);
     n->mission = get32(mid);
     n->self.id = id;
     n->self.range = range;
@@ -633,10 +738,11 @@ int sw_init(sw_node *n, sw_u16 id, sw_u16 range, sw_u16 mtu,
     return SW_OK;
 }
 
+/* finite check with ordered comparisons only: NaN and +-inf fail both */
 static int isreal(const sw_real *x, unsigned k)
 {
     while (k--)
-        if (x[k] != x[k] || x[k] - x[k] != 0)
+        if (!(x[k] >= -RMAX && x[k] <= RMAX))
             return 0;
     return 1;
 }
@@ -719,64 +825,92 @@ int sw_set_self(sw_node *n, const sw_state *s, sw_u32 now)
     return SW_OK;
 }
 
-int sw_task(sw_node *n, unsigned leaf, unsigned st, sw_u16 cost, sw_u32 now)
+int sw_task(sw_node *n, unsigned leaf, unsigned st, sw_u16 cost,
+            sw_u32 lease, sw_u32 now)
 {
-    const sw_rec *c;
-    sw_rec r;
-    sw_u32 base = now;
+    const sw_u8 *c;
+    sw_u8 r[SW_REC_LEN];
+    sw_u32 ver, base = now;
 
     if (!n || leaf >= n->ntask || n->cnt[leaf] || st > SW_DONE)
         return SW_EARG;
-    c = &n->rec[leaf];
-    if (c->st == SW_DONE)
+    c = n->rec[leaf];
+    ver = get32(c + 5);
+    if (c[0] == SW_DONE)
         return SW_EDONE;
     if (st == SW_CLAIMED) {
-        if (c->st == SW_CLAIMED && c->owner != n->self.id && c->ver > now &&
-            cost >= c->cost)
+        if (!lease)
+            lease = SW_LEASE_MS;
+        if (c[0] == SW_CLAIMED && get16(c + 1) != n->self.id && ver > now &&
+            cost >= get16(c + 3))
             return SW_EBUSY;
-        if (now > U32MAX - SW_LEASE_MS)
+        if (now > U32MAX - lease)
             return SW_ETIME;
-        base = now + SW_LEASE_MS;
+        base = now + lease;
     } else if (st == SW_OPEN &&
-               (c->st != SW_CLAIMED || c->owner != n->self.id)) {
+               (c[0] != SW_CLAIMED || get16(c + 1) != n->self.id)) {
         return SW_EARG;
     }
     /* strictly above what we have seen: our action dominates it. DONE
      * wins at any version, so it may saturate. */
-    if (c->ver == U32MAX) {
+    if (ver == U32MAX) {
         if (st != SW_DONE)
             return SW_ETIME;
-        r.ver = U32MAX;
     } else {
-        r.ver = c->ver + 1 > base ? c->ver + 1 : base;
+        ver = ver + 1 > base ? ver + 1 : base;
     }
-    r.st = (sw_u8)st;
-    r.owner = n->self.id;
-    r.cost = cost;
-    set_rec(n, leaf, &r, n->self.id);
+    rec_make(r, st, n->self.id, cost, ver);
+    set_rec(n, leaf, r, n->self.id);
+    return SW_OK;
+}
+
+int sw_leaf(const sw_node *n, unsigned leaf, sw_rec *out)
+{
+    const sw_u8 *r;
+
+    if (!n || !out || leaf >= n->ntask || n->cnt[leaf])
+        return SW_EARG;
+    r = n->rec[leaf];
+    out->st = r[0];
+    out->owner = (sw_u16)get16(r + 1);
+    out->cost = (sw_u16)get16(r + 3);
+    out->ver = get32(r + 5);
     return SW_OK;
 }
 
 unsigned sw_tick(sw_node *n, sw_u32 now, sw_u16 *nbr, unsigned max)
 {
-    unsigned i, k = 0;
+    const sw_u8 *r;
+    const sw_ctx *c;
+    sw_real ps[3], vs;
+    sw_u32 ver;
+    unsigned i, k = 0, off;
 
     if (!n || (max && !nbr))
         return 0;
     for (i = 0; i < n->npeer;)
         if (age(n->peer[i].stamp, now) > SW_TTL_MS)
-            n->peer[i] = n->peer[--n->npeer];
+            peer_del(n, i);
         else
             i++;
-    for (i = 0; i < n->ntask; i++)
-        if (!n->cnt[i] && n->rec[i].st == SW_CLAIMED &&
-            n->rec[i].owner == n->self.id &&
-            (n->rec[i].ver <= now || n->rec[i].ver - now < SW_LEASE_MS / 2))
-            sw_task(n, i, SW_CLAIMED, n->rec[i].cost, now);
+    for (i = 0; i < n->ntask; i++) {
+        r = n->rec[i];
+        ver = get32(r + 5);
+        if (!n->cnt[i] && r[0] == SW_CLAIMED && get16(r + 1) == n->self.id &&
+            (ver <= now || ver - now < SW_LEASE_MS / 2))
+            sw_task(n, i, SW_CLAIMED, (sw_u16)get16(r + 3), 0, now);
+    }
     rehash(n);
-    for (i = 0; i < n->npeer && k < max; i++)
-        if (reach(&n->self, &n->peer[i], now))
-            nbr[k++] = n->peer[i].id;
+    /* id order from a start that moves pseudo-randomly with time, so with
+     * more neighbours than link slots none is starved of a slot; our own
+     * position is predicted once */
+    off = (unsigned)((sw_u32)(now * 2654435761UL) >> 16);
+    vs = predict(&n->self, now, ps);
+    for (i = 0; i < n->npeer && k < max; i++) {
+        c = &n->peer[n->pix[(off + i) % n->npeer]];
+        if (edge(ps, vs, n->self.range, c, now))
+            nbr[k++] = c->id;
+    }
     return k;
 }
 
@@ -785,6 +919,7 @@ int sw_encode(sw_node *n, sw_u16 dst, sw_u32 now, sw_u8 *buf, unsigned cap)
     const sw_ctx *d;
     sw_link *l = 0;
     sw_u8 *w, *end, *nrec, *nctx;
+    sw_real ps[3], vs;
     unsigned lim, P, s0 = 0, i, k, cur, fresh;
 
     if (!n || !buf || dst == n->self.id)
@@ -794,15 +929,18 @@ int sw_encode(sw_node *n, sw_u16 dst, sw_u32 now, sw_u8 *buf, unsigned cap)
         lim = (unsigned)INT_MAX;
     if (dst != SW_BCAST) {
         d = peer_find(n, dst);
-        if (!d || age(d->stamp, now) > SW_TTL_MS || !reach(&n->self, d, now))
+        if (!d || age(d->stamp, now) > SW_TTL_MS)
+            return SW_EREACH;
+        vs = predict(&n->self, now, ps);
+        if (!edge(ps, vs, n->self.range, d, now))
             return SW_EREACH;
         if (d->mtu < lim)
             lim = d->mtu;
     }
     if (lim < SW_FRAME_MIN)
         return SW_ESHORT;
-    if (dst != SW_BCAST)
-        l = link_get(n, dst, now);
+    if (dst != SW_BCAST && !(l = link_get(n, dst, now)))
+        return SW_ESLOT;
     rehash(n);
     end = buf + lim - SW_MAC;
     buf[0] = SW_VERSION;
@@ -850,7 +988,7 @@ int sw_encode(sw_node *n, sw_u16 dst, sw_u32 now, sw_u8 *buf, unsigned cap)
         for (k = 0; k < l->npush && (unsigned)(end - w) >= 3 + SW_REC_LEN;
              k++) {
             put16(w, l->push[k]);
-            rec_put(w + 2, &n->rec[l->push[k]]);
+            memcpy(w + 2, n->rec[l->push[k]], SW_REC_LEN);
             w += 2 + SW_REC_LEN;
             ++*nrec;
         }
@@ -866,7 +1004,7 @@ int sw_encode(sw_node *n, sw_u16 dst, sw_u32 now, sw_u8 *buf, unsigned cap)
             if ((unsigned)(end - w) < 3 + SW_REC_LEN)
                 break;
             put16(w, n->logleaf[k]);
-            rec_put(w + 2, &n->rec[n->logleaf[k]]);
+            memcpy(w + 2, n->rec[n->logleaf[k]], SW_REC_LEN);
             w += 2 + SW_REC_LEN;
             ++*nrec;
         }
@@ -886,7 +1024,7 @@ int sw_encode(sw_node *n, sw_u16 dst, sw_u32 now, sw_u8 *buf, unsigned cap)
         }
         l->ctxcur = (sw_u8)((cur + k) % n->npeer);
     }
-    b2s(w, SW_MAC, n->key, n->klen, buf, (unsigned)(w - buf));
+    b2s(w, SW_MAC, n->key, SW_KEY, buf, (unsigned)(w - buf));
     return (int)(w + SW_MAC - buf);
 }
 
@@ -896,7 +1034,7 @@ int sw_decode(sw_node *n, const sw_u8 *buf, unsigned len, sw_u32 now)
     sw_u8 mac[SW_MAC], diff = 0;
     sw_link *l;
     sw_ctx c;
-    sw_rec r;
+    sw_real pc[3], vc;
     unsigned src, dst, k, i;
 
     if (!n || !buf)
@@ -913,7 +1051,7 @@ int sw_decode(sw_node *n, const sw_u8 *buf, unsigned len, sw_u32 now)
         (dst != n->self.id && dst != SW_BCAST))
         return SW_EADDR;
     e = buf + len - SW_MAC;
-    b2s(mac, SW_MAC, n->key, n->klen, buf, len - SW_MAC);
+    b2s(mac, SW_MAC, n->key, SW_KEY, buf, len - SW_MAC);
     for (k = 0; k < SW_MAC; k++)
         diff |= (sw_u8)(mac[k] ^ e[k]);
     if (diff)
@@ -929,25 +1067,31 @@ int sw_decode(sw_node *n, const sw_u8 *buf, unsigned len, sw_u32 now)
         age(c.stamp, now) > SW_TTL_MS)
         return SW_ESTALE;
     /* inbound only along an edge src -> us of the reach graph */
-    if (!reach(&c, &n->self, now))
+    ctx_cache(&c);
+    vc = predict(&c, now, pc);
+    if (!edge(pc, vc, c.range, &n->self, now))
         return SW_EREACH;
     /* every element below is checked before it is merged; merges are
      * monotone, so a frame rejected half-way leaves a valid state */
     peer_merge(n, &c, now);
+    /* without a free slot the frame is still merged, only no feedback is
+     * kept for the sender */
     l = link_get(n, src, now);
-    l->fb |= FB_ROOT;
-    memcpy(l->root, buf + 10, SW_HASH);
-    /* only a unicast to us proves it answers probes; a beacon must not
-     * mark the link fresh and suppress the sweep */
-    if (dst == n->self.id) {
-        l->fb |= FB_HEARD;
-        l->heard = now;
+    if (l) {
+        l->fb |= FB_ROOT;
+        memcpy(l->root, buf + 10, SW_HASH);
+        /* only a unicast to us proves it answers probes; a beacon must not
+         * mark the link fresh and suppress the sweep */
+        if (dst == n->self.id) {
+            l->fb |= FB_HEARD;
+            l->heard = now;
+        }
     }
     rehash(n);
     /* the probe queue persists across frames: clearing it on each arrival
      * lets beacons or unequal send rates livelock the descent */
     for (k = buf[1]; k; k--)
-        if (!(p = probe_get(n, l, p, e)))
+        if (!(p = probe_get(n, l, src, p, e)))
             return SW_EFIELD;
     if (p >= e)
         return SW_EFIELD;
@@ -955,9 +1099,9 @@ int sw_decode(sw_node *n, const sw_u8 *buf, unsigned len, sw_u32 now)
         if (e - p < 2 + SW_REC_LEN)
             return SW_EFIELD;
         i = get16(p);
-        if (i >= n->ntask || n->cnt[i] || !rec_get(&r, p + 2))
+        if (i >= n->ntask || n->cnt[i] || p[2] > SW_DONE)
             return SW_EFIELD;
-        merge_rec(n, i, &r, src);
+        merge_rec(n, i, p + 2, src);
         p += 2 + SW_REC_LEN;
     }
     if (p >= e)

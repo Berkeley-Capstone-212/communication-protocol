@@ -60,19 +60,24 @@ typedef double sw_real;
 #ifndef SW_LOG          /* change-log ring, power of two */
 #define SW_LOG 32
 #endif
-#ifndef SW_OP_MAX       /* operation-info placeholder bytes (<=255) */
+/* Placeholder sizes (<=255). The defaults fill sw_ctx exactly, so bytes
+ * that would otherwise be alignment padding are usable. */
+#ifndef SW_OP_MAX       /* operation-info placeholder bytes */
 #define SW_OP_MAX 8
 #endif
-#ifndef SW_CTX_MAX      /* context placeholder bytes (<=255) */
-#define SW_CTX_MAX 16
+#ifndef SW_CTX_MAX      /* context placeholder bytes */
+#define SW_CTX_MAX 21
 #endif
 
 /* ---- timing and gating ---------------------------------------------- */
 #ifndef SW_TTL_MS       /* context older than this is forgotten */
 #define SW_TTL_MS 10000UL
 #endif
-#ifndef SW_LEASE_MS     /* claim lease; owner renews at half-life */
+#ifndef SW_LEASE_MS     /* default claim lease; owner renews at half-life */
 #define SW_LEASE_MS 30000UL
+#endif
+#ifndef SW_SLOT_MS      /* least time a link slot is held before rotating */
+#define SW_SLOT_MS 5000UL
 #endif
 #ifndef SW_SKEW_MS      /* tolerated clock skew for future stamps */
 #define SW_SKEW_MS 1000UL
@@ -89,10 +94,10 @@ typedef double sw_real;
 #define SW_BCAST 0xFFFF   /* destination of a discovery beacon */
 #define SW_HASH 8         /* Merkle node hash bytes */
 #define SW_MAC 8          /* frame tag bytes */
-#define SW_KEY_MAX 32
+#define SW_KEY 32         /* derived mission key bytes */
 #define SW_HDR_LEN 18
 #define SW_CTX_LEN 43     /* fixed part of one context on the wire */
-#define SW_REC_LEN 9
+#define SW_REC_LEN 9      /* st u8, owner u16, cost u16, ver u32 */
 /* Smallest MTU that always fits the own context, the largest probe and one
  * record, so every frame makes sync progress. */
 #define SW_FRAME_MIN (SW_HDR_LEN + SW_CTX_LEN + SW_OP_MAX + SW_CTX_MAX + \
@@ -112,27 +117,30 @@ typedef double sw_real;
 #define SW_EADDR (-5)     /* not addressed to us, or from our own id */
 #define SW_EAUTH (-6)     /* tag mismatch */
 #define SW_EFIELD (-7)    /* malformed field */
-#define SW_ESTALE (-8)    /* sender stamp in the future */
+#define SW_ESTALE (-8)    /* sender context too old or in the future */
 #define SW_EREACH (-9)    /* peer is not a neighbour on the reach graph */
 #define SW_EBUSY (-10)    /* leaf held by a cheaper live claim */
 #define SW_EDONE (-11)    /* leaf already done */
 #define SW_ETIME (-12)    /* version space exhausted */
+#define SW_ESLOT (-13)    /* all link slots held; served in rotation, retry */
 
 /* Own estimator output, from an EqF / error-state filter on SE_2(3). */
 typedef struct {
+    const sw_u8 *op;  /* operation info placeholder */
+    const sw_u8 *ctx; /* context placeholder */
     sw_real q[4];     /* attitude, Hamilton (w,x,y,z), body -> mission */
     sw_real v[3];     /* velocity in mission frame, m/s */
     sw_real p[3];     /* position in mission frame (ENU at anchor), m */
     sw_real sig[3];   /* conservative 1-sigma: attitude rad, vel m/s, pos m */
-    const sw_u8 *op;  /* operation info placeholder */
     unsigned op_len;
-    const sw_u8 *ctx; /* context placeholder */
     unsigned ctx_len;
 } sw_state;
 
 /* One drone's context. Tangent coordinates are kept quantised exactly as
- * received so relaying never adds error; p, v, sp, sv are a decoded cache. */
+ * received so relaying never adds error; p, v, sp, sv are a decoded cache.
+ * Members are ordered by alignment so the default build has no padding. */
 typedef struct {
+    sw_real p[3], v[3], sp, sv;
     sw_u32 stamp;     /* origin time of the estimate */
     sw_i32 rho[3];    /* J(theta)^-1 p, mm */
     sw_i16 th[3];     /* so(3) part, 1e-4 rad */
@@ -146,21 +154,24 @@ typedef struct {
     sw_u8 ctx_len;
     sw_u8 op[SW_OP_MAX];
     sw_u8 ctx[SW_CTX_MAX];
-    sw_real p[3], v[3], sp, sv;
 } sw_ctx;
 
-/* Replicated leaf record. Records form a total order (see sw_task); merge
- * keeps the maximum, so replicas converge in any delivery order. */
+/* Decoded view of a leaf record (sw_leaf). Records form a total order;
+ * merge keeps the maximum, so replicas converge in any delivery order. */
 typedef struct {
     sw_u32 ver;       /* claim: lease expiry; otherwise action time */
     sw_u16 owner;
     sw_u16 cost;
-    sw_u8 st;
+    unsigned st;
 } sw_rec;
 
+/* Per-neighbour sync state. With more neighbours than SW_MAX_NBR, slots
+ * rotate first-in-first-out after SW_SLOT_MS, so each neighbour gets a
+ * stable window instead of every link being evicted on every frame. */
 typedef struct {
-    sw_u32 heard;     /* last frame from this neighbour */
-    sw_u32 seen;      /* last use, for eviction */
+    sw_u32 heard;     /* last unicast from this neighbour */
+    sw_u32 seen;      /* last use; an older one means it was out of touch */
+    sw_u32 since;     /* slot taken */
     sw_u32 logpos;    /* change-log position already sent */
     sw_u16 id;
     sw_u16 sweep;     /* fallback cursor when it never answers */
@@ -173,26 +184,30 @@ typedef struct {
     sw_u8 root[SW_HASH];
 } sw_link;
 
-/* Treat as read-only outside the API, except rec[] / tflag[] for queries. */
+/* Treat as read-only outside the API, except tflag[] for queries. Peers and
+ * links are found by id through a sorted index (pid/lid -> pix/lix). */
 typedef struct {
     sw_ctx self;
     sw_ctx peer[SW_MAX_NODES];
     sw_link link[SW_MAX_NBR];
-    sw_rec rec[SW_MAX_TASK];
-    sw_u8 hash[SW_MAX_TASK][SW_HASH];
-    sw_u16 first[SW_MAX_TASK];
-    sw_u16 parent[SW_MAX_TASK];
-    sw_u8 cnt[SW_MAX_TASK];
-    sw_u8 tflag[SW_MAX_TASK];     /* bit1: subtree complete */
-    sw_u16 logleaf[SW_LOG];
-    sw_u16 logsrc[SW_LOG];
     sw_u32 loghead;
     sw_u32 mission;
+    sw_u16 first[SW_MAX_TASK];
+    sw_u16 parent[SW_MAX_TASK];
+    sw_u16 logleaf[SW_LOG];
+    sw_u16 logsrc[SW_LOG];
+    sw_u16 pid[SW_MAX_NODES];     /* peer ids, ascending */
+    sw_u16 lid[SW_MAX_NBR];       /* link ids, ascending */
     sw_u16 ntask;
+    sw_u8 rec[SW_MAX_TASK][SW_REC_LEN]; /* leaf records in wire form */
+    sw_u8 hash[SW_MAX_TASK][SW_HASH];
+    sw_u8 cnt[SW_MAX_TASK];
+    sw_u8 tflag[SW_MAX_TASK];     /* bit1: subtree complete */
+    sw_u8 pix[SW_MAX_NODES];      /* peer slot of pid[k] */
+    sw_u8 lix[SW_MAX_NBR];        /* link slot of lid[k] */
+    sw_u8 key[SW_KEY];
     sw_u8 npeer;
     sw_u8 nlink;
-    sw_u8 key[SW_KEY_MAX];
-    sw_u8 klen;
 } sw_node;
 
 /* tflag[] and SW_GOAL_DONE are current after sw_tick (or sw_encode) */
@@ -201,16 +216,21 @@ typedef struct {
 
 /* Goal tree in breadth-first order: cnt[i] = number of children of node i,
  * 0 for a leaf. Node 0 is the goal and must have children. Identical on
- * every drone; it and the key define the mission. */
+ * every drone; it and the key (any length) define the mission. */
 int sw_init(sw_node *n, sw_u16 id, sw_u16 range, sw_u16 mtu,
             const sw_u8 *cnt, unsigned ntask, const sw_u8 *key, unsigned klen);
 /* Call at least every SW_TTL_MS (with unknown sigma if there is no fix):
  * frames whose sender context is older are rejected as stale. */
 int sw_set_self(sw_node *n, const sw_state *s, sw_u32 now);
-/* Local leaf action: SW_CLAIMED (bid `cost`, lower wins), SW_OPEN (release
- * own claim) or SW_DONE. */
-int sw_task(sw_node *n, unsigned leaf, unsigned st, sw_u16 cost, sw_u32 now);
-/* Maintenance; writes current out-neighbours to nbr, returns how many. */
+/* Local leaf action: SW_CLAIMED (bid `cost`, lower wins; `lease` ms, 0 for
+ * SW_LEASE_MS), SW_OPEN (release own claim) or SW_DONE. A lease longer
+ * than the expected link outage keeps others from taking over the task
+ * while this drone is out of touch; re-claim to extend it. */
+int sw_task(sw_node *n, unsigned leaf, unsigned st, sw_u16 cost,
+            sw_u32 lease, sw_u32 now);
+int sw_leaf(const sw_node *n, unsigned leaf, sw_rec *out);
+/* Maintenance; writes current out-neighbours to nbr (rotating order, so
+ * every neighbour is first in turn), returns how many. */
 unsigned sw_tick(sw_node *n, sw_u32 now, sw_u16 *nbr, unsigned max);
 /* Frame for one out-neighbour, or SW_BCAST beacon. Returns length or error. */
 int sw_encode(sw_node *n, sw_u16 dst, sw_u32 now, sw_u8 *buf, unsigned cap);
