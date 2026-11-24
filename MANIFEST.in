@@ -1,0 +1,3 @@
+include include/swarm.h src/swarm.c
+include python/swarm_protocol/_swarm.c python/swarm_protocol/py.typed
+recursive-include python/tests *.py

@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "swarm-protocol"
+dynamic = ["version"]
+description = "Python bindings for swarm, a decentralised communication protocol for UAV swarms"
+readme = "README.md"
+requires-python = ">=3.10"
+classifiers = [
+    "Programming Language :: C",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: Implementation :: CPython",
+]
+
+[tool.setuptools]
+package-dir = { "" = "python" }
+packages = ["swarm_protocol"]
+include-package-data = false  # C sources go in the sdist only
+
+[tool.setuptools.package-data]
+swarm_protocol = ["py.typed"]
+
+[tool.setuptools.dynamic]
+version = { attr = "swarm_protocol.__version__" }

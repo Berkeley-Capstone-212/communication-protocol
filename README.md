@@ -28,6 +28,7 @@ default limits the code is about 10.7 KB (arm64, `-Os`) and each node needs
 include/swarm.h     API, wire constants, compile-time limits
 src/swarm.c         implementation (single translation unit)
 test/test_swarm.c   unit, fuzz and swarm-simulation tests
+python/             Python package swarm_protocol and its tests
 ```
 
 ## Build
@@ -340,6 +341,48 @@ for (;;) {                                   /* e.g. 10 Hz */
 
 `now` is milliseconds since the mission epoch on the GNSS-disciplined clock
 that all drones share.
+
+## Python
+
+The same library is available as the `swarm_protocol` package. It is the
+C code compiled as a CPython extension (stable ABI, CPython 3.10 and
+newer) with a thin Python layer on top. Installing from source needs a C
+compiler: Xcode command-line tools, `build-essential`, or MSVC Build Tools.
+
+```
+pip install "git+ssh://git@github.com/Berkeley-Capstone-212/communication-protocol.git"
+pip install -e .                                 # from a checkout
+python -m unittest discover -s python/tests      # binding tests
+```
+
+```python
+import swarm_protocol as sw
+
+node = sw.Node(1, range=500, mtu=255, tree=[2, 0, 0], key=b"mission key")
+node.set_self(now, p=(0.0, 0.0, 50.0), v=(1.0, 0.0, 0.0),
+              q=(1.0, 0.0, 0.0, 0.0), sig=(0.01, 0.1, 2.0))
+for dst in node.tick(now):
+    try:
+        radio_send(dst, node.encode(dst, now))
+    except sw.SwarmError as e:       # e.code == sw.ESLOT: retry next tick
+        pass
+radio_send_all(node.beacon(now))
+try:
+    node.decode(frame, now)
+except sw.SwarmError:                # out of range, stale, other mission...
+    pass
+node.claim(1, now, cost=10, lease=60_000)
+node.leaf(1)       # Record(state=CLAIMED, owner=1, cost=10, ver=...)
+node.peers()       # [Context(id, hops, stamp, range, mtu, p, v, theta, ...)]
+```
+
+Each method calls one `sw_*` function. A negative result raises
+`SwarmError`, and its `code` is the C result (`sw.EREACH`, `sw.ESLOT`, ...).
+Times are the same unsigned 32-bit milliseconds as in C. `sig=None` means
+unknown (no fix). `root_hash`, `goal_done` and `complete(i)` are current
+after `tick`. The package is built with the default limits above
+(`sw.MAX_NODES`, `sw.MAX_NBR`, ...), and `sw.NODE_BYTES` reports the size
+of `sw_node`.
 
 ## How the three papers shape the protocol
 
